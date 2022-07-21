@@ -1,5 +1,14 @@
 * What's new in version 4.8
 
+- The target(s) of process probes may be specified by path names,
+  which can be found on one or more debuginfod servers. This allows
+  for all versions of a program to be probed without needing to
+  determine the specific buildids. The following probes all of the 
+  curl versions (known to the debuginfod servers) running on the machine.
+  
+  # export DEBUGINFOD_URLS="URL1 URL2 ..."
+  # stap -e 'probe debuginfod.process("*curl").begin { log("hi") }'
+
 * What's new in version 4.7, 2022-05-02
 
 - SystemTap now supports an additional method to sign modules on

@@ -53,9 +53,9 @@ stap_SOURCES = main.cxx session.cxx \
 	tapset-dynprobe.cxx tapset-method.cxx translator-output.cxx \
         stapregex.cxx stapregex-tree.cxx stapregex-parse.cxx \
 	stapregex-dfa.cxx stringtable.cxx tapset-python.cxx \
-	analysis.cxx
+	tapset-debuginfod.cxx analysis.cxx
 noinst_HEADERS = sdt_types.h
-stap_LDADD = @stap_LIBS@ @sqlite3_LIBS@ @LIBINTL@ -lpthread @debuginfod_LIBS@ @DYNINST_LDFLAGS@ @DYNINST_LIBS@
+stap_LDADD = @stap_LIBS@ @sqlite3_LIBS@ @LIBINTL@ -lpthread @debuginfod_LIBS@ @DYNINST_LDFLAGS@ @DYNINST_LIBS@ -larchive @jsonc_LIBS@
 stap_DEPENDENCIES =
 
 if HAVE_LIBREADLINE
