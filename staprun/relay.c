@@ -7,10 +7,14 @@
  * Public License (GPL); either version 2, or (at your option) any
  * later version.
  *
- * Copyright (C) 2007-2013 Red Hat Inc.
+ * Copyright (C) 2007-2023 Red Hat Inc.
  */
 
 #include "staprun.h"
+#include <string.h>
+#define NDEBUG
+#include "gheap.h"
+
 
 int out_fd[MAX_NR_CPUS];
 int monitor_end = 0;
@@ -25,11 +29,6 @@ static time_t *time_backlog[MAX_NR_CPUS];
 static int backlog_order=0;
 #define BACKLOG_MASK ((1 << backlog_order) - 1)
 #define MONITORLINELENGTH 4096
-
-/* tracking message sequence #s for cross-cpu merging */
-static uint32_t last_sequence_number;
-static pthread_mutex_t last_sequence_number_mutex = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t last_sequence_number_changed = PTHREAD_COND_INITIALIZER;
 
 #ifdef NEED_PPOLL
 int ppoll(struct pollfd *fds, nfds_t nfds,
@@ -124,12 +123,317 @@ static int switch_outfile(int cpu, int *fnum)
 	return 0;
 }
 
-/**
- *	reader_thread - per-cpu channel buffer reader
- */
-static void *reader_thread(void *data)
+
+
+/* In serialized (non-bulk) output mode, ndividual messages that have
+ been received from the kernel per-cpu relays are stored in an central
+ serializing data structure.  They are ordered by message sequence
+ number.  An additional thread (serializer_thread) scans & sequences
+ the output. */
+struct serialized_message {
+        struct _stp_trace bufhdr;
+        time_t received; // timestamp when this message was enqueued
+        char *buf; // malloc()'d size >= rounded(bufhdr.pdu_len)
+};
+static struct serialized_message* buffer_heap = NULL; // the heap
+
+// NB: we control memory via raelloc(), gheap just manipulates entries in place
+static unsigned buffer_heap_size = 0; // used number of entries 
+static unsigned buffer_heap_alloc = 0; // allocation length, always >= buffer_heap_size
+static unsigned last_sequence_number = 0; // last processed sequential message number
+static unsigned lost_message_count = 0; // how many sequence numbers we know we missed
+
+// concurrency control for the buffer_heap
+static pthread_cond_t buffer_heap_cond = PTHREAD_COND_INITIALIZER;
+static pthread_mutex_t buffer_heap_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_t serializer_thread; // ! bulkmode only
+
+
+static void buffer_heap_mover (void *const dest, const void *const src)
 {
-        char buf[128*1024]; // NB: maximum possible output amount from a single probe hit's print_flush
+        memmove (dest, src, sizeof(struct serialized_message));
+}
+
+// NB: since we want to sort messages into an INCREASING heap sequence,
+// we reverse the normal comparison operator.  gheap_pop_heap() should
+// therefore return the SMALLEST element.
+static int buffer_heap_comparer (const void *const ctx, const void *a, const void *b)
+{
+        (void) ctx;
+        uint32_t aa = ((struct serialized_message *)a)->bufhdr.sequence;
+        uint32_t bb = ((struct serialized_message *)b)->bufhdr.sequence;
+        return (aa > bb);
+}        
+
+static const struct gheap_ctx buffer_heap_ctx = {
+        .item_size = sizeof(struct serialized_message),
+        .less_comparer = buffer_heap_comparer,
+        .item_mover = buffer_heap_mover,
+        .page_chunks = 16, // arbitrary
+        .fanout = 2 // standard binary heap
+};
+
+
+#define MAX_MESSAGE_LENGTH (128*1024) /* maximum likely length of a single pdu */
+
+
+
+/* Thread that reads per-cpu messages, and stuffs complete ones into
+   dynamically allocated serialized_message nodes in a binary tree. */
+static void* reader_thread_serialmode (void *data)
+{
+        int rc, cpu = (int)(long)data;
+        struct pollfd pollfd;
+        /* 200ms, close to human level of "instant" */
+	struct timespec tim = {.tv_sec=0, .tv_nsec=200000000}, *timeout = &tim;
+	sigset_t sigs;
+	cpu_set_t cpu_mask;
+                
+	sigemptyset(&sigs);
+	sigaddset(&sigs,SIGUSR2);
+	pthread_sigmask(SIG_BLOCK, &sigs, NULL);
+
+	sigfillset(&sigs);
+	sigdelset(&sigs,SIGUSR2);
+
+	CPU_ZERO(&cpu_mask);
+	CPU_SET(cpu, &cpu_mask);
+	if( sched_setaffinity( 0, sizeof(cpu_mask), &cpu_mask ) < 0 )
+		_perr("sched_setaffinity");
+
+        if (reader_timeout_ms && timeout) {
+                timeout->tv_sec = reader_timeout_ms / 1000;
+                timeout->tv_nsec = (reader_timeout_ms - timeout->tv_sec * 1000) * 1000000;
+        }
+
+	pollfd.fd = relay_fd[cpu];
+	pollfd.events = POLLIN;
+
+        while (! stop_threads) {
+                // read a message header
+                struct serialized_message message;
+                
+                rc = ppoll(&pollfd, 1, timeout, &sigs);
+                if (rc < 0) {
+			dbug(3, "cpu=%d poll=%d errno=%d\n", cpu, rc, errno);
+			if (errno == EINTR) {
+				if (stop_threads)
+					break;
+			} else {
+				_perr("poll error");
+				goto error_out;
+			}
+                }
+
+                // set the timestamp
+                message.received = time(NULL);
+
+                /* Read the header. */
+                rc = read(relay_fd[cpu], &message.bufhdr, sizeof(message.bufhdr));
+                if (rc <= 0) /* seen during normal shutdown or error */
+                        continue;
+                if (rc != sizeof(message.bufhdr)) {
+                        _perr("bufhdr read error rc=%d, attempting resync", rc);
+                        char buf[MAX_MESSAGE_LENGTH]; // random size
+                        rc = read(relay_fd[cpu], buf, sizeof(buf)); /* drain the buffers */
+                        (void) rc;
+                        continue;
+                }
+
+                /* Validate it slightly.  Because of lost messages, we might be getting
+                   not a proper _stp_trace struct but the interior of some piece of 
+                   trace text message.  XXX: validate bufhdr.sequence a little bit too? */
+                if (message.bufhdr.pdu_len == 0 || message.bufhdr.pdu_len > MAX_MESSAGE_LENGTH) {
+                        _perr("bufhdr corrupt len=%u, attempting resync", message.bufhdr.pdu_len);
+                        char buf[MAX_MESSAGE_LENGTH]; // random size
+                        rc = read(relay_fd[cpu], buf, sizeof(buf)); /* drain the buffers */
+                        (void) rc;
+                        continue; /* may resync at next subbuf boundary so don't give up */
+                }
+
+                // Allocate the pdu body
+                message.buf = malloc(message.bufhdr.pdu_len);
+                if (message.buf == NULL)
+                {
+                        _perr("out of memory while allocating pdu");
+                        char buf[MAX_MESSAGE_LENGTH]; // random size
+                        rc = read(relay_fd[cpu], buf, sizeof(buf)); /* drain the buffers */
+                        (void) rc;
+                        continue;
+                }
+                
+                /* Read the message, perhaps in pieces (such as if crossing
+                 * relayfs subbuf boundaries). */
+                size_t bufread = 0;
+                while (bufread < message.bufhdr.pdu_len) {
+                        rc = read(relay_fd[cpu], message.buf+bufread, message.bufhdr.pdu_len-bufread);
+                        if (rc <= 0) {
+                                /* _perr("partial message received"); */
+                                break; /* still process it; hope we can resync next time. */
+                        }
+                        bufread += rc;
+                }
+
+                // plop the message into the buffer_heap
+                pthread_mutex_lock(& buffer_heap_mutex);
+                if (message.bufhdr.sequence < last_sequence_number) {
+                        // whoa! is this some old message that we've assumed lost?
+                        // or are we wrapping around the uint_32 sequence numbers?
+                        _perr("unexpected sequence=%u", message.bufhdr.sequence);
+                }
+                        
+                // is it large enough?  if not, realloc
+                if (buffer_heap_alloc - buffer_heap_size == 0) { // full
+                        unsigned new_buffer_heap_alloc = (buffer_heap_alloc + 1) * 1.5;
+                        struct serialized_message *new_buffer_heap =
+                                realloc(buffer_heap,
+                                        new_buffer_heap_alloc * sizeof(struct serialized_message));
+                        if (new_buffer_heap == NULL) {
+                                _perr("out of memory while enlarging buffer heap");
+                                free (message.buf);
+                                lost_message_count ++;
+                                pthread_mutex_unlock(& buffer_heap_mutex);
+                                continue;
+                        }
+                        buffer_heap = new_buffer_heap;
+                        buffer_heap_alloc = new_buffer_heap_alloc;
+                }
+                // plop copy of message struct into slot at end of heap
+                buffer_heap[buffer_heap_size++] = message;
+                // push it into heap
+                gheap_push_heap(&buffer_heap_ctx,
+                                buffer_heap,
+                                buffer_heap_size);
+                // and c'est tout
+                pthread_mutex_unlock(& buffer_heap_mutex);
+                pthread_cond_broadcast (& buffer_heap_cond);
+                dbug(3, "thread %d received seq=%u\n", cpu, message.bufhdr.sequence);
+        }
+
+	dbug(3, "exiting thread for cpu %d\n", cpu);
+        return NULL;
+        
+error_out:
+	/* Signal the main thread that we need to quit */
+	kill(getpid(), SIGTERM);
+	dbug(2, "exiting thread for cpu %d after error\n", cpu);
+        
+        return NULL;
+}
+
+
+/* Thread that checks on the heap of messages, and pumps them out to
+   the designated output fd in sequence.  It waits, but only a little
+   while, if it has only fresher messages than it's expecting.  It
+   exits upon a global stop_threads indication.
+*/
+static void* reader_thread_serializer (void *data) {
+        (void) data;
+        while (! stop_threads) {
+                /* timeout 0-1 seconds; this is the maximum extra time that
+                   stapio will be waiting after a ^C */
+                struct timespec ts = {.tv_sec=time(NULL)+1, .tv_nsec=0};
+                int rc;
+                pthread_mutex_lock(& buffer_heap_mutex);                
+                rc = pthread_cond_timedwait (& buffer_heap_cond,
+                                             & buffer_heap_mutex,
+                                             & ts);
+
+		dbug(3, "serializer cond wait rc=%d heapsize=%u\n", rc, buffer_heap_size);
+                time_t now = time(NULL);
+                unsigned processed = 0;
+                while (buffer_heap_size > 0) { // consume as much as possible
+                        // check out the sequence# of the first element
+                        uint32_t buf_min_seq = buffer_heap[0].bufhdr.sequence;
+                        dbug(3, "serializer last=%u seq=%u\n", last_sequence_number, buf_min_seq);
+                        if ((buf_min_seq == last_sequence_number + 1) || // expected seq#
+                            (buffer_heap[0].received + 2 <= now)) {  // message too old
+                                // "we've got one!" -- or waited too long for one
+                                // get it off the head of the heap
+                                gheap_pop_heap(&buffer_heap_ctx,
+                                               buffer_heap,
+                                               buffer_heap_size);
+                                buffer_heap_size --; // becomes index where the head was moved
+                                processed ++;
+
+                                // take a copy of the whole message
+                                struct serialized_message msg = buffer_heap[buffer_heap_size];
+                                
+                                // paranoid clear this field of the now-unused slot
+                                buffer_heap[buffer_heap_size].buf = NULL;
+                                // update statistics
+                                lost_message_count += (buf_min_seq - last_sequence_number - 1);
+                                last_sequence_number = buf_min_seq;
+                                
+                                // unlock the mutex, permitting
+                                // reader_thread_serialmode threads to
+                                // resume piling messages into the
+                                // heap while we print stuff
+                                pthread_mutex_unlock(& buffer_heap_mutex);
+
+                                // write loop ... could block if e.g. the output disk is slow
+                                // or the user hits a ^S (XOFF) on the tty
+                                ssize_t sent = 0;
+                                do {
+                                        ssize_t ret = write (out_fd[avail_cpus[0]],
+                                                             msg.buf+sent, msg.bufhdr.pdu_len-sent);
+                                        if (ret <= 0) {
+                                                perr("error writing output");
+                                                break;
+                                        }
+                                        sent += ret;
+                                } while ((unsigned)sent < msg.bufhdr.pdu_len);
+
+                                // free the associated buffer
+                                free (msg.buf);
+
+                                // must re-take lock for next iteration of the while loop
+                                pthread_mutex_lock(& buffer_heap_mutex);
+                        } else {
+                                // processed as much of the heap as we
+                                // could this time; wait for the
+                                // condition again
+                                break;
+                        }
+                }
+                pthread_mutex_unlock(& buffer_heap_mutex);
+                if (processed > 0)
+                        dbug(2, "serializer processed n=%u\n", processed);
+        }
+        return NULL;        
+}
+
+
+// At the end of the program main loop, flush out any the remaining
+// messages and free up all that heapy data.
+static void reader_serialized_flush()
+{
+        dbug(3, "serializer flushing messages=%u\n", buffer_heap_size);
+        while (buffer_heap_size > 0) { // consume it all
+                // check out the sequence# of the first element
+                uint32_t buf_min_seq = buffer_heap[0].bufhdr.sequence;
+                dbug(3, "serializer seq=%u\n", buf_min_seq);
+                gheap_pop_heap(&buffer_heap_ctx,
+                               buffer_heap,
+                               buffer_heap_size);
+                buffer_heap_size --; // also index where the head was moved
+                // XXX: print it!
+                // XXX: free it!
+                lost_message_count += (buf_min_seq - last_sequence_number - 1);
+                last_sequence_number = buf_min_seq;                
+        }
+        free (buffer_heap);
+        buffer_heap = NULL;
+}
+
+
+
+/**
+ *	reader_thread - per-cpu channel buffer reader, bulkmode (one output file per cpu input file)
+ */
+static void *reader_thread_bulkmode (void *data)
+{
+        char buf[MAX_MESSAGE_LENGTH];
         struct _stp_trace bufhdr;
 
         int rc, cpu = (int)(long)data;
@@ -229,23 +533,6 @@ static void *reader_thread(void *data)
                         bufread += rc;
                 }
 
-                if (! bulkmode) {
-                        /* Wait until the bufhdr.sequence number indicates it's OUR TURN to go ahead. */
-                        struct timespec ts = {.tv_sec=time(NULL)+2, .tv_nsec=0}; /* wait 1-2 seconds */
-                        pthread_mutex_lock(& last_sequence_number_mutex);
-                        while ((last_sequence_number+1 != bufhdr.sequence) && /* normal case */
-                               (last_sequence_number < bufhdr.sequence)) { /* we're late!!! */
-                                int rc = pthread_cond_timedwait (& last_sequence_number_changed,
-                                                                 & last_sequence_number_mutex,
-                                                                 & ts);
-                                if (rc == ETIMEDOUT) {
-                                        /* _perr("message sequencing timeout"); */
-                                        break;
-                                }
-                        }
-                        pthread_mutex_unlock(& last_sequence_number_mutex);
-                }
-                
                 int wbytes = rc;
                 char *wbuf = buf;
 
@@ -292,13 +579,8 @@ static void *reader_thread(void *data)
                                 int fd;
                                 /* Only bulkmode and fsize_max use per-cpu output files. Otherwise,
                                    there's just a single output fd stored at out_fd[avail_cpus[0]]. */
-                                if (bulkmode || fsize_max)
-                                        fd = out_fd[cpu];
-                                else
-                                        fd = out_fd[avail_cpus[0]];
-                                rc = 0;
-                                if (bulkmode)
-                                        rc = write(fd, &bufhdr, sizeof(bufhdr)); // write header
+                                fd = out_fd[cpu];
+                                rc = write(fd, &bufhdr, sizeof(bufhdr)); // write header
                                 rc |= write(fd, wbuf, wbytes); // write payload
                                 if (rc <= 0) {
                                         perr("Couldn't write to output %d for cpu %d, exiting.",
@@ -311,14 +593,6 @@ static void *reader_thread(void *data)
                         }
                 }
 
-                /* update the sequence number & let other cpus go ahead */
-                pthread_mutex_lock(& last_sequence_number_mutex);
-                if (last_sequence_number < bufhdr.sequence) { /* not if someone leapfrogged us */
-                        last_sequence_number = bufhdr.sequence;
-                        pthread_cond_broadcast (& last_sequence_number_changed);
-                }
-                pthread_mutex_unlock(& last_sequence_number_mutex);
-                
         } while (!stop_threads);
 	dbug(3, "exiting thread for cpu %d\n", cpu);
 	return(NULL);
@@ -515,12 +789,19 @@ int init_relayfs(void)
 		}
 	}
         for (i = 0; i < ncpus; i++) {
-                if (pthread_create(&reader[avail_cpus[i]], NULL, reader_thread,
+                if (pthread_create(&reader[avail_cpus[i]], NULL,
+                                   bulkmode ? reader_thread_bulkmode : reader_thread_serialmode,
                                    (void *)(long)avail_cpus[i]) < 0) {
                         _perr("failed to create thread");
                         return -1;
                 }
         }
+        if (! bulkmode)
+                if (pthread_create(&serializer_thread, NULL,
+                                   reader_thread_serializer, NULL) < 0) {
+                        _perr("failed to create thread");
+                        return -1;
+                }
 
 	return 0;
 }
@@ -530,18 +811,32 @@ void close_relayfs(void)
 	int i;
 	stop_threads = 1;
 	dbug(2, "closing\n");
+#if 0 /* XXX: needed at all? */
 	for (i = 0; i < ncpus; i++) {
 		if (reader[avail_cpus[i]])
 			pthread_kill(reader[avail_cpus[i]], SIGUSR2);
 		else
 			break;
 	}
+        if (! bulkmode)
+                pthread_kill(serializer_thread, SIGINT);
+#endif
 	for (i = 0; i < ncpus; i++) {
 		if (reader[avail_cpus[i]])
 			pthread_join(reader[avail_cpus[i]], NULL);
 		else
 			break;
 	}
+        if (! bulkmode) {
+                pthread_join(serializer_thread, NULL);
+                // at this point, we know all reader and writer
+                // threads for the buffer_heap are dead.
+                reader_serialized_flush();
+
+                if (lost_message_count > 0)
+                        eprintf("WARNING: There were %u lost messages.", lost_message_count); 
+        }
+
 	for (i = 0; i < ncpus; i++) {
 		if (relay_fd[avail_cpus[i]] >= 0)
 			close(relay_fd[avail_cpus[i]]);
