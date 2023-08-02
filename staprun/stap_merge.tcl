@@ -51,6 +51,7 @@ foreach file $files {
 	exit 1
     }
     fconfigure $fd($n) -translation binary
+    set magic [read $fd($mincpu) 4]
     if {![binary scan [read $fd($n) 4] $int_format timestamp($n)]} {
 	continue
     }
@@ -90,6 +91,7 @@ while {1} {
     set data [read $fd($mincpu) $len]
     puts -nonewline $outfile $data
 
+    set magic [read $fd($mincpu) 4]
     set data [read $fd($mincpu) 4]
     if {$data == ""} {
 	unset fd($mincpu)
