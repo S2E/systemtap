@@ -130,9 +130,9 @@ static int switch_outfile(int cpu, int *fnum)
 
 /* In serialized (non-bulk) output mode, ndividual messages that have
  been received from the kernel per-cpu relays are stored in an central
- serializing data structure.  They are ordered by message sequence
- number.  An additional thread (serializer_thread) scans & sequences
- the output. */
+ serializing data structure - in this case, a heap.  They are ordered
+ by message sequence number.  An additional thread (serializer_thread)
+ scans & sequences the output. */
 struct serialized_message {
         union {
                 struct _stp_trace bufhdr;
@@ -143,7 +143,7 @@ struct serialized_message {
 };
 static struct serialized_message* buffer_heap = NULL; // the heap
 
-// NB: we control memory via raelloc(), gheap just manipulates entries in place
+// NB: we control memory via realloc(), gheap just manipulates entries in place
 static unsigned buffer_heap_size = 0; // used number of entries 
 static unsigned buffer_heap_alloc = 0; // allocation length, always >= buffer_heap_size
 static unsigned last_sequence_number = 0; // last processed sequential message number
@@ -345,6 +345,27 @@ error_out:
 // Print and free buffer of given serialized message.
 static void print_serialized_message (struct serialized_message *msg)
 {
+        // check if file switching is necessary, as per staprun -S
+
+        // NB: unlike reader_thread_bulkmode(), we don't need to use
+        // mutexes to protect switch_file[] or such, because we're the
+        // ONLY thread doing output.
+        unsigned cpu = 0; // arbitrary
+        static ssize_t wsize = 0; // how many bytes we've written into the serialized file so far
+        static int fnum = 0; // which file number we're using
+
+        if ((fsize_max && (wsize > fsize_max)) ||
+            switch_file[cpu]) {
+                dbug(2, "switching output file wsize=%ld fsize_max=%ld\n", wsize, fsize_max);
+                if (switch_outfile(cpu, &fnum) < 0) {
+                        perr("unable to switch output file");
+                        // but continue
+                }
+                switch_file[cpu] = 0;
+                wsize = 0;
+        }
+
+        
         // write loop ... could block if e.g. the output disk is slow
         // or the user hits a ^S (XOFF) on the tty
         ssize_t sent = 0;
@@ -357,6 +378,7 @@ static void print_serialized_message (struct serialized_message *msg)
                 }
                 sent += ret;
         } while ((unsigned)sent < msg->bufhdr.pdu_len);
+        wsize += sent;
         
         // free the associated buffer
         free (msg->buf);
@@ -864,10 +886,9 @@ void close_relayfs(void)
                 // threads for the buffer_heap are dead.
                 reader_serialized_flush();
 
-                if (lost_message_count > 0)
-                        eprintf("WARNING: There were %u lost messages.", lost_message_count); 
-                if (lost_byte_count > 0)
-                        eprintf("WARNING: There were %u lost bytes.", lost_byte_count); 
+                if (lost_message_count > 0 || lost_byte_count > 0)
+                        eprintf("WARNING: There were %u lost messages and %u lost bytes.\n",
+                                lost_message_count, lost_byte_count); 
         }
 
 	for (i = 0; i < ncpus; i++) {
