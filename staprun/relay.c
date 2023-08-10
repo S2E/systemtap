@@ -197,8 +197,6 @@ static void* reader_thread_serialmode (void *data)
 {
         int rc, cpu = (int)(long)data;
         struct pollfd pollfd;
-        /* 200ms, close to human level of "instant" */
-	struct timespec tim = {.tv_sec=0, .tv_nsec=200000000}, *timeout = &tim;
 	sigset_t sigs;
 	cpu_set_t cpu_mask;
                 
@@ -214,17 +212,17 @@ static void* reader_thread_serialmode (void *data)
 	if( sched_setaffinity( 0, sizeof(cpu_mask), &cpu_mask ) < 0 )
 		_perr("sched_setaffinity");
 
-        if (reader_timeout_ms && timeout) {
-                timeout->tv_sec = reader_timeout_ms / 1000;
-                timeout->tv_nsec = (reader_timeout_ms - timeout->tv_sec * 1000) * 1000000;
-        }
-
 	pollfd.fd = relay_fd[cpu];
 	pollfd.events = POLLIN;
 
         while (! stop_threads) {
                 // read a message header
                 struct serialized_message message;
+                
+                /* 200ms, close to human level of "instant" */
+                struct timespec tim, *timeout = &tim;
+                timeout->tv_sec = reader_timeout_ms / 1000;
+                timeout->tv_nsec = (reader_timeout_ms - timeout->tv_sec * 1000) * 1000000;
                 
                 rc = ppoll(&pollfd, 1, timeout, &sigs);
                 if (rc < 0) {
@@ -497,8 +495,6 @@ static void *reader_thread_bulkmode (void *data)
 
         int rc, cpu = (int)(long)data;
         struct pollfd pollfd;
-        /* 200ms, close to human level of "instant" */
-	struct timespec tim = {.tv_sec=0, .tv_nsec=200000000}, *timeout = &tim;
 	sigset_t sigs;
 	off_t wsize = 0;
 	int fnum = 0;
@@ -515,27 +511,17 @@ static void *reader_thread_bulkmode (void *data)
 	CPU_SET(cpu, &cpu_mask);
 	if( sched_setaffinity( 0, sizeof(cpu_mask), &cpu_mask ) < 0 )
 		_perr("sched_setaffinity");
-#ifdef NEED_PPOLL
-	/* Without a real ppoll, there is a small race condition that could */
-	/* block ppoll(). So use a timeout to prevent that. */
-	timeout->tv_sec = 10;
-	timeout->tv_nsec = 0;
-#else
-	timeout = NULL;
-#endif
-
-        if (reader_timeout_ms && timeout) {
-                timeout->tv_sec = reader_timeout_ms / 1000;
-                timeout->tv_nsec = (reader_timeout_ms - timeout->tv_sec * 1000) * 1000000;
-        }
 
 	pollfd.fd = relay_fd[cpu];
 	pollfd.events = POLLIN;
 
         do {
-		dbug(3, "thread %d start ppoll\n", cpu);
+                /* 200ms, close to human level of "instant" */
+                struct timespec tim, *timeout = &tim;
+                timeout->tv_sec = reader_timeout_ms / 1000;
+                timeout->tv_nsec = (reader_timeout_ms - timeout->tv_sec * 1000) * 1000000;
+                
                 rc = ppoll(&pollfd, 1, timeout, &sigs);
-		dbug(3, "thread %d end ppoll:%d\n", cpu, rc);
                 if (rc < 0) {
 			dbug(3, "cpu=%d poll=%d errno=%d\n", cpu, rc, errno);
 			if (errno == EINTR) {
@@ -557,7 +543,7 @@ static void *reader_thread_bulkmode (void *data)
 
                 /* Read the header. */
                 rc = read(relay_fd[cpu], &bufhdr, sizeof(bufhdr));
-                if (rc == 0) /* seen during normal shutdown */
+                if (rc <= 0) /* seen during normal shutdown */
                         continue;
                 if (rc != sizeof(bufhdr)) {
                         _perr("bufhdr read error, attempting resync");
