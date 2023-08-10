@@ -22,12 +22,12 @@
 int out_fd[MAX_NR_CPUS];
 int monitor_end = 0;
 static pthread_t reader[MAX_NR_CPUS];
-static int relay_fd[MAX_NR_CPUS];
+static int relay_fd[MAX_NR_CPUS]; // fd to kernel per-cpu relayfs
 static int avail_cpus[MAX_NR_CPUS];
-static int switch_file[MAX_NR_CPUS];
-static pthread_mutex_t mutex[MAX_NR_CPUS];
+static volatile sig_atomic_t sigusr2_count; // number of SIGUSR2's received by process
+static int sigusr2_processed[MAX_NR_CPUS]; // each thread's count of processed SIGUSR2's
 static int bulkmode = 0;
-static volatile int stop_threads = 0;
+static volatile int stop_threads = 0; // set during relayfs_close to signal threads to die
 static time_t *time_backlog[MAX_NR_CPUS];
 static int backlog_order=0;
 #define BACKLOG_MASK ((1 << backlog_order) - 1)
@@ -355,13 +355,14 @@ static void print_serialized_message (struct serialized_message *msg)
         static int fnum = 0; // which file number we're using
 
         if ((fsize_max && (wsize > fsize_max)) ||
-            switch_file[cpu]) {
-                dbug(2, "switching output file wsize=%ld fsize_max=%ld\n", wsize, fsize_max);
+            (sigusr2_count > sigusr2_processed[cpu])) {
+                dbug(2, "switching output file wsize=%ld fsize_max=%ld sigusr2 %d > %d\n",
+                     wsize, fsize_max, sigusr2_count, sigusr2_processed[cpu]);
+                sigusr2_processed[cpu] = sigusr2_count;                
                 if (switch_outfile(cpu, &fnum) < 0) {
                         perr("unable to switch output file");
                         // but continue
                 }
-                switch_file[cpu] = 0;
                 wsize = 0;
         }
 
@@ -409,7 +410,9 @@ static void* reader_thread_serializer (void *data) {
                 while (buffer_heap_size > 0) { // consume as much as possible
                         // check out the sequence# of the first element
                         uint32_t buf_min_seq = buffer_heap[0].bufhdr.sequence;
+
                         dbug(3, "serializer last=%u seq=%u\n", last_sequence_number, buf_min_seq);
+                                
                         if ((buf_min_seq == last_sequence_number + 1) || // expected seq#
                             (buffer_heap[0].received + 2 <= now)) {  // message too old
                                 // "we've got one!" -- or waited too long for one
@@ -426,7 +429,10 @@ static void* reader_thread_serializer (void *data) {
                                 // paranoid clear this field of the now-unused slot
                                 buffer_heap[buffer_heap_size].buf = NULL;
                                 // update statistics
-                                lost_message_count += (buf_min_seq - last_sequence_number - 1);
+                                if (attach_mod == 1 && last_sequence_number == 0) // first message after staprun -A
+                                        ; // do not penalize it with lost messages
+                                else
+                                        lost_message_count += (buf_min_seq - last_sequence_number - 1);
                                 last_sequence_number = buf_min_seq;
                                 
                                 // unlock the mutex, permitting
@@ -536,17 +542,13 @@ static void *reader_thread_bulkmode (void *data)
 				if (stop_threads)
 					break;
 
-				pthread_mutex_lock(&mutex[cpu]);
-				if (switch_file[cpu]) {
-					if (switch_outfile(cpu, &fnum) < 0) {
-						switch_file[cpu] = 0;
-						pthread_mutex_unlock(&mutex[cpu]);
+                                if (sigusr2_count > sigusr2_processed[cpu]) {
+                                       sigusr2_processed[cpu] = sigusr2_count;
+                                       if (switch_outfile(cpu, &fnum) < 0) {
 						goto error_out;
-					}
-					switch_file[cpu] = 0;
-					wsize = 0;
+                                       }
+                                       wsize = 0;
 				}
-				pthread_mutex_unlock(&mutex[cpu]);
 			} else {
 				_perr("poll error");
 				goto error_out;
@@ -592,18 +594,14 @@ static void *reader_thread_bulkmode (void *data)
                 dbug(3, "cpu %d: read %d bytes of data\n", cpu, rc);
 
                 /* Switching file */
-                pthread_mutex_lock(&mutex[cpu]);
                 if ((fsize_max && ((wsize + rc) > fsize_max)) ||
-                    switch_file[cpu]) {
+                    (sigusr2_count > sigusr2_processed[cpu])) {
+                        sigusr2_processed[cpu] = sigusr2_count;
                         if (switch_outfile(cpu, &fnum) < 0) {
-                                switch_file[cpu] = 0;
-                                pthread_mutex_unlock(&mutex[cpu]);
                                 goto error_out;
                         }
-                        switch_file[cpu] = 0;
                         wsize = 0;
                 }
-                pthread_mutex_unlock(&mutex[cpu]);
 
                 /* Copy loop.  Must repeat write(2) in case of a pipe overflow
                    or other transient fullness. */
@@ -657,40 +655,15 @@ error_out:
 	return(NULL);
 }
 
+
 static void switchfile_handler(int sig)
 {
-	int i;
+        (void) sig;
 	if (stop_threads || !outfile_name)
 		return;
-
-	for (i = 0; i < ncpus; i++) {
-		pthread_mutex_lock(&mutex[avail_cpus[i]]);
-		if (reader[avail_cpus[i]] && switch_file[avail_cpus[i]]) {
-			pthread_mutex_unlock(&mutex[avail_cpus[i]]);
-			dbug(2, "file switching is progressing, signal ignored.\n", sig);
-			return;
-		}
-		pthread_mutex_unlock(&mutex[avail_cpus[i]]);
-	}
-	for (i = 0; i < ncpus; i++) {
-		pthread_mutex_lock(&mutex[avail_cpus[i]]);
-		if (reader[avail_cpus[i]]) {
-			switch_file[avail_cpus[i]] = 1;
-			pthread_mutex_unlock(&mutex[avail_cpus[i]]);
-
-			// Make sure we don't send the USR2 signal to
-			// ourselves.
-			if (pthread_equal(pthread_self(),
-					  reader[avail_cpus[i]]))
-				break;
-			pthread_kill(reader[avail_cpus[i]], SIGUSR2);
-		}
-		else {
-			pthread_mutex_unlock(&mutex[avail_cpus[i]]);
-			break;
-		}
-	}
+        sigusr2_count ++;
 }
+
 
 /**
  *	init_relayfs - create files and threads for relayfs processing
@@ -835,12 +808,6 @@ int init_relayfs(void)
         sigaction(SIGUSR2, &sa, NULL);
 
         dbug(2, "starting threads\n");
-	for (i = 0; i < ncpus; i++) {
-		if (pthread_mutex_init(&mutex[avail_cpus[i]], NULL) < 0) {
-                        _perr("failed to create mutex");
-                        return -1;
-		}
-	}
         for (i = 0; i < ncpus; i++) {
                 if (pthread_create(&reader[avail_cpus[i]], NULL,
                                    bulkmode ? reader_thread_bulkmode : reader_thread_serialmode,
@@ -864,16 +831,7 @@ void close_relayfs(void)
 	int i;
 	stop_threads = 1;
 	dbug(2, "closing\n");
-#if 0 /* XXX: needed at all? */
-	for (i = 0; i < ncpus; i++) {
-		if (reader[avail_cpus[i]])
-			pthread_kill(reader[avail_cpus[i]], SIGUSR2);
-		else
-			break;
-	}
-        if (! bulkmode)
-                pthread_kill(serializer_thread, SIGINT);
-#endif
+
 	for (i = 0; i < ncpus; i++) {
 		if (reader[avail_cpus[i]])
 			pthread_join(reader[avail_cpus[i]], NULL);
@@ -881,7 +839,8 @@ void close_relayfs(void)
 			break;
 	}
         if (! bulkmode) {
-                pthread_join(serializer_thread, NULL);
+                if (serializer_thread) // =0 on load_only!
+                        pthread_join(serializer_thread, NULL);
                 // at this point, we know all reader and writer
                 // threads for the buffer_heap are dead.
                 reader_serialized_flush();
@@ -897,9 +856,6 @@ void close_relayfs(void)
 		else
 			break;
 	}
-	for (i = 0; i < ncpus; i++) {
-		pthread_mutex_destroy(&mutex[avail_cpus[i]]);
-	}
 	dbug(2, "done\n");
 }
 
@@ -908,12 +864,6 @@ void kill_relayfs(void)
 	int i;
 	stop_threads = 1;
 	dbug(2, "killing\n");
-	for (i = 0; i < ncpus; i++) {
-		if (reader[avail_cpus[i]])
-			pthread_kill(reader[avail_cpus[i]], SIGUSR2);
-		else
-			break;
-	}
 	for (i = 0; i < ncpus; i++) {
 		if (reader[avail_cpus[i]])
 			pthread_cancel(reader[avail_cpus[i]]); /* no wait */
@@ -925,9 +875,6 @@ void kill_relayfs(void)
 			close(relay_fd[avail_cpus[i]]);
 		else
 			break;
-	}
-	for (i = 0; i < ncpus; i++) {
-		pthread_mutex_destroy(&mutex[avail_cpus[i]]);
 	}
 	dbug(2, "done\n");
 }
