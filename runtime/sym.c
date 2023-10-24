@@ -26,8 +26,6 @@
 #include <linux/uaccess.h>
 #endif
 
-#define STP_MAX_DW_SOURCES 20
-
 /* Returns absolute address of offset into kernel module/section.
    Returns zero when module and section couldn't be found
    (aren't in memory yet). */
