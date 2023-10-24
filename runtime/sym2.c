@@ -50,12 +50,15 @@ static void _stp_filename_lookup_5(struct _stp_module *mod, char ** filename,
   // Next comes directory_entry_format
   for (i = 0; i < directory_entry_format_count; i++)
     {
-      c->dw_data.dir_enc[i].desc = read_pointer ((const uint8_t **) &debug_line_p, enddirsecp, DW_EH_PE_leb128, user, compat_task);
-      c->dw_data.dir_enc[i].form = read_pointer ((const uint8_t **) &debug_line_p, enddirsecp, DW_EH_PE_leb128, user, compat_task);
+      c->dw_data.dir_enc[i].desc = read_pointer ((const uint8_t **) &debug_line_p,
+                                                 enddirsecp, DW_EH_PE_leb128, user, compat_task);
+      c->dw_data.dir_enc[i].form = read_pointer ((const uint8_t **) &debug_line_p,
+                                                 enddirsecp, DW_EH_PE_leb128, user, compat_task);
     }
 
   // Next comes directories_count
-  directories_count = read_pointer ((const uint8_t **) &debug_line_p, enddirsecp, DW_EH_PE_leb128, user, compat_task);
+  directories_count = read_pointer ((const uint8_t **) &debug_line_p,
+                                    enddirsecp, DW_EH_PE_leb128, user, compat_task);
   if (directories_count > STP_MAX_DW_SOURCES)
     return;
 
@@ -66,13 +69,15 @@ static void _stp_filename_lookup_5(struct _stp_module *mod, char ** filename,
           switch (c->dw_data.dir_enc[j].form)
             {
               case DW_FORM_line_strp:
-                c->dw_data.src_dir[i].offset = (uint8_t) read_pointer ((const uint8_t **) &debug_line_p, enddirsecp, DW_EH_PE_data4, user, compat_task);
+                c->dw_data.src_dir[i].offset = (uint8_t) read_pointer ((const uint8_t **) &debug_line_p,
+                                                                       enddirsecp, DW_EH_PE_data4, user, compat_task);
                 if ((uint8_t *) mod->debug_line_str + c->dw_data.src_dir[i].offset > endstrsecp)
                   return;
                 c->dw_data.src_dir[i].name = mod->debug_line_str + c->dw_data.src_dir[i].offset;
                 break;
               default:
-                _stp_error("BUG: Unknown form %d encountered while parsing source dir\n", c->dw_data.dir_enc[j].form);
+                _stp_error("BUG: Unknown form %d encountered while parsing source dir\n",
+                           c->dw_data.dir_enc[j].form);
                 return;
             }
 
@@ -87,13 +92,18 @@ static void _stp_filename_lookup_5(struct _stp_module *mod, char ** filename,
   // Next comes file_name_entry_format
   for (i = 0; i < file_name_entry_format_count; i++)
     {
-      c->dw_data.file_enc[i].desc = read_pointer ((const uint8_t **) &debug_line_p, enddirsecp, DW_EH_PE_leb128, user, compat_task);
-      c->dw_data.file_enc[i].form = read_pointer ((const uint8_t **) &debug_line_p, enddirsecp, DW_EH_PE_leb128, user, compat_task);
+      c->dw_data.file_enc[i].desc = read_pointer ((const uint8_t **) &debug_line_p,
+                                                  enddirsecp, DW_EH_PE_leb128, user,
+                                                  compat_task);
+      c->dw_data.file_enc[i].form = read_pointer ((const uint8_t **) &debug_line_p,
+                                                  enddirsecp, DW_EH_PE_leb128, user,
+                                                  compat_task);
     }
 
   // Next comes the file_names_count
   // See elfutil's print_form_data() in readelf.c for an analogy of what happens below
-  file_names_count = read_pointer ((const uint8_t **) &debug_line_p, enddirsecp, DW_EH_PE_leb128, user, compat_task);
+  file_names_count = read_pointer ((const uint8_t **) &debug_line_p, enddirsecp,
+                                   DW_EH_PE_leb128, user, compat_task);
   if (file_names_count > STP_MAX_DW_SOURCES)
     return;
 
@@ -103,7 +113,9 @@ static void _stp_filename_lookup_5(struct _stp_module *mod, char ** filename,
           switch (c->dw_data.file_enc[j].form)
             {
               case DW_FORM_line_strp:
-                c->dw_data.src_file[i].offset = (uint8_t) read_pointer ((const uint8_t **) &debug_line_p, enddirsecp, DW_EH_PE_data4, user, compat_task);
+                c->dw_data.src_file[i].offset = (uint8_t) read_pointer ((const uint8_t **) &debug_line_p,
+                                                                        enddirsecp, DW_EH_PE_data4, user,
+                                                                        compat_task);
                 if ((uint8_t *) mod->debug_line_str + c->dw_data.src_file[i].offset > endstrsecp)
                   return;
                 c->dw_data.src_file[i].name = mod->debug_line_str + c->dw_data.src_file[i].offset;
@@ -115,10 +127,13 @@ static void _stp_filename_lookup_5(struct _stp_module *mod, char ** filename,
                 debug_line_p += 16;
                 break;
               case DW_FORM_udata:
-                c->dw_data.src_file[i].dirindex = (uint8_t) read_pointer ((const uint8_t **) &debug_line_p, enddirsecp, DW_EH_PE_leb128, user, compat_task);
+                c->dw_data.src_file[i].dirindex = (uint8_t) read_pointer ((const uint8_t **) &debug_line_p,
+                                                                          enddirsecp, DW_EH_PE_leb128, user,
+                                                                          compat_task);
                 break;
               default:
-                _stp_error("BUG: Unknown form %d encountered while parsing source file\n", c->dw_data.file_enc[j].form);
+                _stp_error("BUG: Unknown form %d encountered while parsing source file\n",
+                           c->dw_data.file_enc[j].form);
                 return;
             }
 
