@@ -8474,6 +8474,8 @@ translate_pass (systemtap_session& s)
       if (s.need_unwind)
 	s.op->newline() << "#include \"stack.c\"";
 
+      s.op->newline() << "#include \"sym2.c\"";
+
       if (s.globals.size()>0)
 	{
 	  s.op->newline() << "struct stp_globals {";

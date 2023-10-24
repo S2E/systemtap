@@ -357,138 +357,22 @@ static void _stp_filename_lookup(struct _stp_module *mod, char ** filename,
     }
 }
 
+// At this point the compiler needs to know the context struct.  The context
+// struct is emitted by s.up->emit_common_header () within translate.cxx way
+// after this file. To solve this problem, keep only the function declaration
+// here, and move the actual function definition out to a separate sym2.c,
+// which is included once the context struct is known.
 static void _stp_filename_lookup_5(struct _stp_module *mod, char ** filename,
                                    uint8_t *dirsecp, uint8_t *enddirsecp,
                                    unsigned int length,
-                                   unsigned fileidx, int user, int compat_task)
-{
-  // Pointer to the .debug_line section
-  // pointing at just after standard_opcode_lengths
-  // which is the last header item common to DWARF v4 and v5.
-  uint8_t *debug_line_p = dirsecp;
-  // Pointer to the beginning of .debug_line_str section
-  uint8_t *debug_line_str_p = mod->debug_line_str;
-  uint8_t *endstrsecp = mod->debug_line_str + mod->debug_line_str_len;
-
-  uint8_t directory_entry_format_count = 0, file_name_entry_format_count = 0,
-          directories_count = 0, file_names_count = 0;
-
-  struct encpair { uint16_t desc; uint16_t form; };
-  struct encpair dir_enc[STP_MAX_DW_SOURCES], file_enc[STP_MAX_DW_SOURCES];
-
-  // Source files and directories
-  struct dirinfo { uint8_t offset; char *name; };
-  struct dirinfo src_dir[STP_MAX_DW_SOURCES];
-  struct fileinfo { uint8_t offset; uint8_t dirindex; char *name; };
-  struct fileinfo src_file[STP_MAX_DW_SOURCES];
-  static char fullpath [MAXSTRINGLEN];
-
-  // Reusable loop iterators.  As the producer records show, the rhel8 kbuild
-  // system uses -std=gnu90 not allowing initial loop declarations, while the
-  // rhel9 build system allows that.  We need to stay compatible though..
-  // https://lwn.net/Articles/885941/
-  int i = 0, j = 0;
-
-  // Initialize the *filename
-  *filename = "unknown";
-
-  // Next comes directory_entry_format_count
-  if (debug_line_str_p + 1 > enddirsecp)
-    return;
-  directory_entry_format_count = *debug_line_p++;
-  if (directory_entry_format_count > STP_MAX_DW_SOURCES)
-    return;
-
-  // Next comes directory_entry_format
-  for (i = 0; i < directory_entry_format_count; i++)
-    {
-      dir_enc[i].desc = read_pointer ((const uint8_t **) &debug_line_p, enddirsecp, DW_EH_PE_leb128, user, compat_task);
-      dir_enc[i].form = read_pointer ((const uint8_t **) &debug_line_p, enddirsecp, DW_EH_PE_leb128, user, compat_task);
-    }
-
-  // Next comes directories_count
-  directories_count = read_pointer ((const uint8_t **) &debug_line_p, enddirsecp, DW_EH_PE_leb128, user, compat_task);
-  if (directories_count > STP_MAX_DW_SOURCES)
-    return;
-
-  // Next come directories
-  // See elfutil's print_form_data() in readelf.c for an analogy of what happens below
-  for (i=0; i < directories_count; i++)
-      for (j=0; j < directory_entry_format_count; j++)
-          switch (dir_enc[j].form)
-            {
-              case DW_FORM_line_strp:
-                src_dir[i].offset = (uint8_t) read_pointer ((const uint8_t **) &debug_line_p, enddirsecp, DW_EH_PE_data4, user, compat_task);
-                if ((uint8_t *) mod->debug_line_str + src_dir[i].offset > endstrsecp)
-                  return;
-                src_dir[i].name = mod->debug_line_str + src_dir[i].offset;
-                break;
-              default:
-                _stp_error("BUG: Unknown form %d encountered while parsing source dir\n", dir_enc[j].form);
-                return;
-            }
-
-  // Next comes file_name_entry_format_count
-  if (debug_line_p + 1 > enddirsecp)
-    return;
-  file_name_entry_format_count = *debug_line_p++;
-  if (file_name_entry_format_count > STP_MAX_DW_SOURCES)
-    return;
-
-
-  // Next comes file_name_entry_format
-  for (i = 0; i < file_name_entry_format_count; i++)
-    {
-      file_enc[i].desc = read_pointer ((const uint8_t **) &debug_line_p, enddirsecp, DW_EH_PE_leb128, user, compat_task);
-      file_enc[i].form = read_pointer ((const uint8_t **) &debug_line_p, enddirsecp, DW_EH_PE_leb128, user, compat_task);
-    }
-
-  // Next comes the file_names_count
-  // See elfutil's print_form_data() in readelf.c for an analogy of what happens below
-  file_names_count = read_pointer ((const uint8_t **) &debug_line_p, enddirsecp, DW_EH_PE_leb128, user, compat_task);
-  if (file_names_count > STP_MAX_DW_SOURCES)
-    return;
-
-  // Next come the files
-  for (i=0; i < file_names_count; i++)
-      for (j=0; j < file_name_entry_format_count; j++)
-          switch (file_enc[j].form)
-            {
-              case DW_FORM_line_strp:
-                src_file[i].offset = (uint8_t) read_pointer ((const uint8_t **) &debug_line_p, enddirsecp, DW_EH_PE_data4, user, compat_task);
-                if ((uint8_t *) mod->debug_line_str + src_file[i].offset > endstrsecp)
-                  return;
-                src_file[i].name = mod->debug_line_str + src_file[i].offset;
-                break;
-              case DW_FORM_data16:
-                // This is how clang encodes the md5sum, skip it
-                if (debug_line_p + 16 > enddirsecp)
-                  return;
-                debug_line_p += 16;
-                break;
-              case DW_FORM_udata:
-                src_file[i].dirindex = (uint8_t) read_pointer ((const uint8_t **) &debug_line_p, enddirsecp, DW_EH_PE_leb128, user, compat_task);
-                break;
-              default:
-                _stp_error("BUG: Unknown form %d encountered while parsing source file\n", file_enc[j].form);
-                return;
-            }
-
-  // Put it together
-  // - requested file index is fileidx
-  //   (based on the line number program)
-  // - find directory respective to this file
-  // - and attach slash and the file name itself
-  strlcpy(fullpath, src_dir[src_file[fileidx].dirindex].name, MAXSTRINGLEN);
-  strlcat(fullpath, "/", MAXSTRINGLEN);
-  strlcat(fullpath, src_file[fileidx].name, MAXSTRINGLEN);
-  *filename = fullpath;
-
-}
+                                   unsigned fileidx, int user, int compat_task,
+                                   struct context *c);
 
 #endif /* STP_NEED_LINE_DATA */
 
-unsigned long _stp_linenumber_lookup(unsigned long addr, struct task_struct *task, char ** filename, int need_filename)
+unsigned long _stp_linenumber_lookup(unsigned long addr, struct task_struct *task,
+                                     char ** filename, int need_filename,
+                                     struct context *c)
 {
   struct _stp_module *m;
   struct _stp_section *sec;
@@ -765,7 +649,7 @@ unsigned long _stp_linenumber_lookup(unsigned long addr, struct task_struct *tas
                     if (version > 4)
                       _stp_filename_lookup_5(m, filename, dirsecp, endhdrp,
                                              length, row_file_idx, user,
-                                             compat_task);
+                                             compat_task, c);
                     else
                       _stp_filename_lookup(m, filename, dirsecp, endhdrp,
                                            row_file_idx, user, compat_task);
@@ -1041,7 +925,7 @@ static int _stp_usermodule_check(struct task_struct *tsk, const char *path_name,
  * @note Symbolic lookups should not normally be done within
  * a probe because it is too time-consuming. Use at module exit time. */
 static int _stp_snprint_addr(char *str, size_t len, unsigned long address,
-			     int flags, struct task_struct *task)
+			     int flags, struct task_struct *task, struct context *c)
 {
   const char *modname = NULL;
   const char *name = NULL;
@@ -1073,7 +957,7 @@ static int _stp_snprint_addr(char *str, size_t len, unsigned long address,
 
   if ((flags & _STP_SYM_LINENUMBER) || (flags & _STP_SYM_FILENAME)) {
       linenumber = _stp_linenumber_lookup (address, task, &filename,
-                                           (int) (flags & _STP_SYM_FILENAME));
+                                           (int) (flags & _STP_SYM_FILENAME), c);
   }
 
   switch (flags & ~_STP_SYM_INEXACT) {
@@ -1220,9 +1104,10 @@ static int _stp_snprint_addr(char *str, size_t len, unsigned long address,
 }
 
 static void _stp_print_addr(unsigned long address, int flags,
-			    struct task_struct *task)
+			    struct task_struct *task,
+                            struct context *c)
 {
-  _stp_snprint_addr(NULL, 0, address, flags, task);
+  _stp_snprint_addr(NULL, 0, address, flags, task, c);
 }
 
 /** @} */
