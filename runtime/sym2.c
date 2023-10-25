@@ -1,3 +1,16 @@
+/* -*- linux-c -*-
+ * Symbolic Lookup Functions
+ * Copyright (C) 2005-2023 Red Hat Inc.
+ * Copyright (C) 2006 Intel Corporation.
+ *
+ * This file is part of systemtap, and is free software.  You can
+ * redistribute it and/or modify it under the terms of the GNU General
+ * Public License (GPL); either version 2, or (at your option) any
+ * later version.
+ */
+
+#if defined _STP_SYM_C_ && defined STP_NEED_LINE_DATA
+
 // At this point the compiler needs to know the context struct.  The context
 // struct is emitted by s.up->emit_common_header () within translate.cxx
 // The _stp_filename_lookup_5 is declared in runtime/sym.c , but at that point
@@ -147,3 +160,5 @@ static void _stp_filename_lookup_5(struct _stp_module *mod, char ** filename,
   strlcat(fullpath, c->dw_data.src_file[fileidx].name, MAXSTRINGLEN);
   *filename = fullpath;
 }
+
+#endif
